@@ -1,0 +1,61 @@
+/*
+ * LCD_Task.c
+ *
+ *  Created on: Oct 16, 2024
+ *      Author: USER
+ */
+
+#include "..\Src\KEY_TASK\Button_Scan.h"
+#include "..\Src\LCD_TASK\LCD_TASK.h"
+#include "..\Src\hardware\I2C_LCD\I2C-Lcd.h"
+#include "stm32f1xx_hal.h"
+#include "FreeRTOS.h"
+#include "task.h"
+
+extern uint8_t button_states[4];   // 外部宣告按鍵狀態 (K1~K4)
+extern uint8_t lcd_address;
+
+void LCD1602_Task(void *pvParameters)
+{
+	char buffer[16]; // 用來顯示字串的緩衝區
+
+	while (1)
+	{
+		// 清除 LCD 並顯示第一行固定內容
+		LCD_Clear(lcd_address);
+		LCD_Set_Cursor(lcd_address, 0, 0);
+		LCD_Send_String(lcd_address, "4131E001");
+
+		// 檢查按鍵狀態
+		LCD_Set_Cursor(lcd_address, 1, 0);
+
+		if (button_states[0] == GPIO_PIN_RESET)
+		{
+			sprintf(buffer, "1");
+			LCD_Send_String(lcd_address, buffer);
+		}
+		else if (button_states[1] == GPIO_PIN_RESET)
+		{
+			sprintf(buffer, "2");
+			LCD_Send_String(lcd_address, buffer);
+		}
+		else if (button_states[2] == GPIO_PIN_RESET)
+		{
+			sprintf(buffer, "3");
+			LCD_Send_String(lcd_address, buffer);
+		}
+		else if (button_states[3] == GPIO_PIN_RESET)
+		{
+			sprintf(buffer, "4");
+			LCD_Send_String(lcd_address, buffer);
+		}
+		else
+		{
+			// 沒有按下任何鍵時顯示預設訊息
+
+			LCD_Send_String(lcd_address, buffer);
+		}
+
+		vTaskDelay(pdMS_TO_TICKS(1000));  // 每 200ms 更新一次
+	}
+}
