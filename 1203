@@ -1,0 +1,53 @@
+case CMD_SETDATE:
+                {
+                    int year, month, day;
+
+                    // 解析 YYYY-MM-DD
+                    if (sscanf(cmd + 8, "%d-%d-%d", &year, &month, &day) == 3)
+                    {
+                        // 基本有效性檢查
+                        if (year >= 2000 && month >= 1 && month <= 12 && day >= 1 && day <= 31)
+                        {
+                            DS3231_Time t;
+
+                            // 先讀出目前時間，避免覆蓋時分秒
+                            if (DS3231_GetTime(&hi2c1, &t) == HAL_OK)
+                            {
+                                t.year  = year - 2000;  // DS3231 從 2000年開始算
+                                t.month = month;
+                                t.date  = day;
+
+                                uint8_t data[3];
+                                data[0] = (t.date / 10 << 4) | (t.date % 10);   // BCD
+                                data[1] = (t.month / 10 << 4) | (t.month % 10); // BCD
+                                data[2] = (t.year / 10 << 4) | (t.year % 10);   // BCD
+
+                                if(HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x04, 1, &data[0], 1, 10) == HAL_OK &&
+                                   HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x05, 1, &data[1], 1, 10) == HAL_OK &&
+                                   HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x06, 1, &data[2], 1, 10) == HAL_OK)
+                                {
+                                    VCP_Send("DATE SET OK, SYSTEM RESTART...\r\n");
+                                    HAL_Delay(100);        // 確保訊息送出
+                                    NVIC_SystemReset();    // 軟體重啟
+                                }
+                                else
+                                {
+                                    VCP_Send("DATE SET ERROR\r\n");
+                                }
+                            }
+                            else
+                            {
+                                VCP_Send("RTC READ ERROR\r\n");
+                            }
+                        }
+                        else
+                        {
+                            VCP_Send("INVALID DATE\r\n");
+                        }
+                    }
+                    else
+                    {
+                        VCP_Send("FORMAT: SETDATE YYYY-MM-DD\r\n");
+                    }
+                    break;
+                }
