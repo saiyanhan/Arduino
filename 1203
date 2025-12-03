@@ -1,53 +1,223 @@
-case CMD_SETDATE:
+/*
+ * VCP_Task.c
+ *
+ *  Created on: Dec 2, 2025
+ *      Author: USER
+ */
+
+// Core/Src/VCP_TASK/VCP_Task.c
+#include "VCP_Task.h"
+#include "main.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "usbd_cdc_if.h"
+
+#include "..\Src\hardware\DS3231\ds3231.h"   // DS3231
+#include <string.h>
+#include <stdio.h>
+static const char prompt[] = "\r\nCH12-2>: ";
+extern I2C_HandleTypeDef hi2c1;              // I2C 來自 main.c
+
+//------------------------------------------------------------------
+//  指令列舉（對 switch-case 最乾淨）
+//------------------------------------------------------------------
+typedef enum {
+    CMD_UNKNOWN = 0,
+    CMD_LEDON,
+    CMD_LEDOFF,
+    CMD_GETTIME,
+    CMD_HELP,
+	CMD_SETDATE,
+} VCP_Command_t;
+
+
+//------------------------------------------------------------------
+//  字串 → enum（完整字串比對）
+//------------------------------------------------------------------
+static VCP_Command_t VCP_ParseCommand(const char *cmd)
+{
+    if (strcmp(cmd, "LEDON")   == 0) return CMD_LEDON;
+    if (strcmp(cmd, "LEDOFF")  == 0) return CMD_LEDOFF;
+    if (strcmp(cmd, "GETTIME") == 0) return CMD_GETTIME;
+    if (strcmp(cmd, "HELP")    == 0) return CMD_HELP;
+    if (strcmp(cmd, "SETDATE") == 0, 7) return CMD_SETDATE;
+
+    return CMD_UNKNOWN;
+}
+
+static void VCP_Send(const char *s)
+{
+    uint16_t len = (uint16_t)strlen(s);
+    while (CDC_Transmit_FS((uint8_t*)s, len) == USBD_BUSY)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+//------------------------------------------------------------------
+//  主任務
+//------------------------------------------------------------------
+void VCP_Task(void *argument)
+{
+    vTaskDelay(pdMS_TO_TICKS(300));   // 等 USB ready
+    // ★ 開機時先送提示符
+        CDC_Transmit_FS((uint8_t*)prompt, strlen((char*)prompt));
+    uint8_t buf[64];
+
+    for (;;)
+    {
+        if (CDC_RxFlag)
+        {
+            CDC_RxFlag = 0;
+
+            uint32_t len = CDC_RxLen;
+            if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+
+            memcpy(buf, CDC_RxBuffer, len);
+            buf[len] = '\0';
+
+            //------------------------------------------------------
+            // ★ 關鍵：去掉尾端的 \r \n 空白（解決 UNKNOWN CMD）
+            //------------------------------------------------------
+            while (len > 0 &&
+                  (buf[len-1] == '\r' ||
+                   buf[len-1] == '\n' ||
+                   buf[len-1] == ' '  ||
+                   buf[len-1] == '\t'))
+            {
+                buf[--len] = '\0';
+            }
+
+            if (len == 0)
+                continue;
+
+            //------------------------------------------------------
+            // 統一轉大寫（使用者打 ledon / LedOn 都可以）
+            //------------------------------------------------------
+            for (uint32_t i = 0; i < len; i++)
+            {
+                if (buf[i] >= 'a' && buf[i] <= 'z')
+                    buf[i] -= 32;
+            }
+
+            char *cmd = (char*)buf;
+
+
+            //------------------------------------------------------
+            // 主 switch-case（你要求的「乾淨版完整字串比對」）
+            //------------------------------------------------------
+            switch (VCP_ParseCommand(cmd))
+            {
+                //--------------------------------------------------
+                case CMD_LEDON:
+                    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
+                    CDC_Transmit_FS((uint8_t*)"LED ON\r\n", 8);
+                    break;
+
+                //--------------------------------------------------
+                case CMD_LEDOFF:
+                    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
+                    CDC_Transmit_FS((uint8_t*)"LED OFF\r\n", 9);
+                    break;
+
+                //--------------------------------------------------
+                case CMD_GETTIME:
                 {
-                    int year, month, day;
+                    DS3231_Time t;
+                    char out[32];
 
-                    // 解析 YYYY-MM-DD
-                    if (sscanf(cmd + 8, "%d-%d-%d", &year, &month, &day) == 3)
+                    if (DS3231_GetTime(&hi2c1, &t) == HAL_OK)
                     {
-                        // 基本有效性檢查
-                        if (year >= 2000 && month >= 1 && month <= 12 && day >= 1 && day <= 31)
-                        {
-                            DS3231_Time t;
-
-                            // 先讀出目前時間，避免覆蓋時分秒
-                            if (DS3231_GetTime(&hi2c1, &t) == HAL_OK)
-                            {
-                                t.year  = year - 2000;  // DS3231 從 2000年開始算
-                                t.month = month;
-                                t.date  = day;
-
-                                uint8_t data[3];
-                                data[0] = (t.date / 10 << 4) | (t.date % 10);   // BCD
-                                data[1] = (t.month / 10 << 4) | (t.month % 10); // BCD
-                                data[2] = (t.year / 10 << 4) | (t.year % 10);   // BCD
-
-                                if(HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x04, 1, &data[0], 1, 10) == HAL_OK &&
-                                   HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x05, 1, &data[1], 1, 10) == HAL_OK &&
-                                   HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x06, 1, &data[2], 1, 10) == HAL_OK)
-                                {
-                                    VCP_Send("DATE SET OK, SYSTEM RESTART...\r\n");
-                                    HAL_Delay(100);        // 確保訊息送出
-                                    NVIC_SystemReset();    // 軟體重啟
-                                }
-                                else
-                                {
-                                    VCP_Send("DATE SET ERROR\r\n");
-                                }
-                            }
-                            else
-                            {
-                                VCP_Send("RTC READ ERROR\r\n");
-                            }
-                        }
-                        else
-                        {
-                            VCP_Send("INVALID DATE\r\n");
-                        }
+                        snprintf(out, sizeof(out),
+                                 "%02d:%02d:%02d\r\n",
+                                 t.hours, t.minutes, t.seconds);
                     }
                     else
                     {
-                        VCP_Send("FORMAT: SETDATE YYYY-MM-DD\r\n");
+                        strcpy(out, "RTC ERROR\r\n");
                     }
+
+                    CDC_Transmit_FS((uint8_t*)out, strlen(out));
                     break;
                 }
+
+                //--------------------------------------------------
+                case CMD_SETDATE:
+                                {
+                                    int year, month, day;
+
+                                    // 解析 YYYY-MM-DD
+                                    if (sscanf(cmd + 8, "%d-%d-%d", &year, &month, &day) == 3)
+                                    {
+                                        // 基本有效性檢查
+                                        if (year >= 2000 && month >= 1 && month <= 12 && day >= 1 && day <= 31)
+                                        {
+                                            DS3231_Time t;
+
+                                            // 先讀出目前時間，避免覆蓋時分秒
+                                            if (DS3231_GetTime(&hi2c1, &t) == HAL_OK)
+                                            {
+                                                t.year  = year - 2000;  // DS3231 從 2000年開始算
+                                                t.month = month;
+                                                t.date  = day;
+
+                                                uint8_t data[3];
+                                                data[0] = (t.date / 10 << 4) | (t.date % 10);   // BCD
+                                                data[1] = (t.month / 10 << 4) | (t.month % 10); // BCD
+                                                data[2] = (t.year / 10 << 4) | (t.year % 10);   // BCD
+
+                                                if(HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x04, 1, &data[0], 1, 10) == HAL_OK &&
+                                                   HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x05, 1, &data[1], 1, 10) == HAL_OK &&
+                                                   HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x06, 1, &data[2], 1, 10) == HAL_OK)
+                                                {
+                                                    VCP_Send("DATE SET OK, SYSTEM RESTART...\r\n");
+                                                    HAL_Delay(100);        // 確保訊息送出
+                                                    NVIC_SystemReset();    // 軟體重啟
+                                                }
+                                                else
+                                                {
+                                                    VCP_Send("DATE SET ERROR\r\n");
+                                                }
+                                            }
+                                            else
+                                            {
+                                                VCP_Send("RTC READ ERROR\r\n");
+                                            }
+                                        }
+                                        else
+                                        {
+                                            VCP_Send("INVALID DATE\r\n");
+                                        }
+                                    }
+                                    else
+                                    {
+                                        VCP_Send("FORMAT: SETDATE YYYY-MM-DD\r\n");
+                                    }
+                                    break;
+                                }
+                //--------------------------------------------------
+                case CMD_HELP:
+                    CDC_Transmit_FS(
+                        (uint8_t*)
+                        "Commands:\r\n"
+                        "LEDON\r\n"
+                        "LEDOFF\r\n"
+                        "GETTIME\r\n"
+						"SETDATE\r\n"
+                        "HELP\r\n",
+                        42
+                    );
+                    break;
+
+                //--------------------------------------------------
+                default:
+                    CDC_Transmit_FS((uint8_t*)"UNKNOWN CMD\r\n", 14);
+                    break;
+            }
+            // ★★★ 在這裡統一送出提示符
+            VCP_Send(prompt);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
