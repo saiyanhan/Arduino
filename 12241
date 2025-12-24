@@ -1,0 +1,30 @@
+/*
+ * eeprom_task.h
+ *
+ *  Created on: Dec 9, 2025
+ *      Author: USER
+ */
+
+#ifndef SRC_EEP24XX_TASK_EEPROM_TASK_H_
+#define SRC_EEP24XX_TASK_EEPROM_TASK_H_
+void EEPROM_Config_SaveNow(void);
+void VCP_Send(const char *s);
+#include "stdint.h"
+
+typedef struct {
+    uint8_t  volume;
+    uint8_t  brightness;
+    char     password[7];
+    char admin_password[7];  // 最多6個字 + '\0'
+    uint16_t magic;
+} AppConfig_t;
+
+extern AppConfig_t g_AppConfigRAM;   // 其他 Task 若要改設定，改這個
+
+void Config_Init(void);              // 開機時呼叫一次
+void StartEepromTask(void *argument);
+
+
+
+
+#endif /* SRC_EEP24XX_TASK_EEPROM_TASK_H_ */
