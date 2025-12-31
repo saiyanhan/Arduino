@@ -1,0 +1,348 @@
+#ifndef AHT10_H
+#define AHT10_H
+
+#include "stm32f1xx_hal.h"
+
+#define AHT10_ADDR 0x70  // I2C 位址 (0x38 << 1)
+
+HAL_StatusTypeDef AHT10_Init(I2C_HandleTypeDef *hi2c);
+HAL_StatusTypeDef AHT10_Read(I2C_HandleTypeDef *hi2c, float *temp, float *humi);
+
+#endif
+
+#include "AHT10.h"
+#include "cmsis_os.h" // 為了使用 vTaskDelay
+
+HAL_StatusTypeDef AHT10_Init(I2C_HandleTypeDef *hi2c) {
+    uint8_t cmd = 0xE1; // 初始化命令
+    vTaskDelay(pdMS_TO_TICKS(40)); // 上電等待
+    return HAL_I2C_Master_Transmit(hi2c, AHT10_ADDR, &cmd, 1, 100);
+}
+
+HAL_StatusTypeDef AHT10_Read(I2C_HandleTypeDef *hi2c, float *temp, float *humi) {
+    uint8_t cmd[3] = {0xAC, 0x33, 0x00}; // 觸發測量命令
+    uint8_t data[6];
+
+    if (HAL_I2C_Master_Transmit(hi2c, AHT10_ADDR, cmd, 3, 100) != HAL_OK) return HAL_ERROR;
+
+    vTaskDelay(pdMS_TO_TICKS(80)); // 轉換時間約 75ms
+
+    if (HAL_I2C_Master_Receive(hi2c, AHT10_ADDR, data, 6, 100) != HAL_OK) return HAL_ERROR;
+
+    // 數據解析
+    uint32_t humi_raw = (((uint32_t)data[1] << 12) | ((uint32_t)data[2] << 4) | (data[3] >> 4));
+    uint32_t temp_raw = (((uint32_t)(data[3] & 0x0F) << 16) | ((uint32_t)data[4] << 8) | data[5]);
+
+    *humi = (float)humi_raw * 100.0f / 1048576.0f;
+    *temp = (float)temp_raw * 200.0f / 1048576.0f - 50.0f;
+
+    return HAL_OK;
+}
+
+/*
+ * VCP_Task.c
+ *
+ * Created on: Dec 2, 2025
+ * Author: USER
+ * 說明：
+ * 本模組為 USB CDC（VCP）指令處理任務，負責：
+ * 1. 接收 PC 端送來的文字指令
+ * 2. 將指令字串轉換為 enum（VCP_Command_t）
+ * 3. 進行登入權限控管
+ * 4. 執行對應功能（LED / DS3231 時間日期 / AHT10 溫濕度 / 密碼）
+ *
+ * 安全規則：
+ * - 系統未登入時只能使用：LOGIN <pwd>
+ */
+
+#include "../VCP_TASK/VCP_Task.h"
+#include "main.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "usbd_cdc_if.h"
+#include "..\Src\hardware\AHT10\aht10.h"                          // AHT10 驅動
+#include "..\Src\hardware\DS3231\ds3231.h"   // DS3231 驅動
+#include <string.h>
+#include <stdio.h>
+#include "..\Src\EEP24XX_TASK\eeprom_task.h"
+
+static const char prompt[] = "\r\nSTM32_FREERTOS>: ";  //提示符
+extern I2C_HandleTypeDef hi2c1;
+extern AppConfig_t g_AppConfigRAM;
+
+/* ===================== 指令 enum 定義 ===================== */
+typedef enum {
+	CMD_UNKNOWN = 0,
+	CMD_LEDON,
+	CMD_LEDOFF,
+	CMD_GETTIME,
+	CMD_GETDT,
+	CMD_SETTIME,
+	CMD_SETDATE,
+	CMD_SETDT,
+	CMD_HELP,
+	CMD_PASS_GET,
+	CMD_PASS_SET,
+	CMD_LOGIN,
+	CMD_LOGOUT,
+	CMD_DBG_TICK,
+	CMD_DBG_TCNT,
+	CMD_DBG_TASK,
+	CMD_GETAHT,
+} VCP_Command_t;
+
+static uint8_t weekday_iso(uint16_t y, uint8_t m, uint8_t d);
+
+/* ===================== 全域狀態 ===================== */
+static uint8_t isLoggedIn = 0;   // 0 = 未登入, 1 = 已登入
+static uint8_t isAdmin = 0;      // 0 = 一般使用者, 1 = 管理員
+
+/* ===================== 指令解析函式 ===================== */
+VCP_Command_t VCP_ParseCommand(const char *cmd) {
+	if (strcmp(cmd, "LEDON") == 0) return CMD_LEDON;
+	if (strcmp(cmd, "LEDOFF") == 0) return CMD_LEDOFF;
+	if (strcmp(cmd, "GETTIME") == 0) return CMD_GETTIME;
+	if (strcmp(cmd, "GETDT") == 0) return CMD_GETDT;
+	if (strcmp(cmd, "GETAHT") == 0) return CMD_GETAHT;
+	if (strncmp(cmd, "SETTIME ", 8) == 0) return CMD_SETTIME;
+	if (strncmp(cmd, "SETDATE ", 8) == 0) return CMD_SETDATE;
+	if (strncmp(cmd, "SETDT ", 6) == 0) return CMD_SETDT;
+	if (strcmp(cmd, "HELP") == 0) return CMD_HELP;
+	if (strcmp(cmd, "PASS GET") == 0) return CMD_PASS_GET;
+	if (strncmp(cmd, "PASS SET ", 9) == 0) return CMD_PASS_SET;
+	if (strncmp(cmd, "LOGIN ", 6) == 0) return CMD_LOGIN;
+	if (strcmp(cmd, "LOGOUT") == 0) return CMD_LOGOUT;
+
+	/* ===== DBG 指令 (僅管理員可用) ===== */
+	if (strcmp(cmd, "DBG_TICK") == 0) return CMD_DBG_TICK;
+	if (strcmp(cmd, "DBG_TCNT") == 0) return CMD_DBG_TCNT;
+	if (strcmp(cmd, "DBG_TASK") == 0) return CMD_DBG_TASK;
+
+	return CMD_UNKNOWN;
+}
+
+/* ===================== VCP 輸出介面 ===================== */
+void VCP_Send(const char *s) {
+	uint16_t len = (uint16_t) strlen(s);
+	while (CDC_Transmit_FS((uint8_t*) s, len) == USBD_BUSY) {
+		vTaskDelay(pdMS_TO_TICKS(1));
+	}
+}
+
+/* ===================== 主任務 ===================== */
+void VCP_Task(void *argument) {
+	vTaskDelay(pdMS_TO_TICKS(500));   // 等待 USB 穩定
+
+	// 1. 初始化 AHT10 溫濕度傳感器
+	if (AHT10_Init(&hi2c1) == HAL_OK) {
+		VCP_Send("AHT10 Sensor initialized.\r\n");
+	} else {
+		VCP_Send("AHT10 Sensor NOT detected!\r\n");
+	}
+
+	// 2. 送出開機歡迎與提示符
+	VCP_Send(prompt);
+
+	// 3. 開機按鍵檢測：K1 + K2 同時按下則重置密碼
+	uint8_t k1 = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8);
+	uint8_t k2 = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_9);
+
+	if (k1 == GPIO_PIN_RESET && k2 == GPIO_PIN_RESET) {
+		strcpy(g_AppConfigRAM.password, "0000");
+		strcpy(g_AppConfigRAM.admin_password, "123456");
+		EEPROM_Config_SaveNow();
+		VCP_Send("PASSWORD RESET TO 0000\r\n");
+		vTaskDelay(pdMS_TO_TICKS(500));
+	}
+
+	uint8_t buf[64];
+
+	for (;;) {
+		if (CDC_RxFlag) {
+			CDC_RxFlag = 0;
+			uint32_t len = CDC_RxLen;
+			if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+
+			memcpy(buf, CDC_RxBuffer, len);
+			buf[len] = '\0';
+
+			// 清除尾端換行符號與空白
+			while (len > 0 && (buf[len - 1] == '\r' || buf[len - 1] == '\n' || buf[len - 1] == ' ' || buf[len - 1] == '\t')) {
+				buf[--len] = '\0';
+			}
+			if (len == 0) continue;
+
+			// 指令轉大寫
+			for (uint32_t i = 0; i < len; i++) {
+				if (buf[i] >= 'a' && buf[i] <= 'z') buf[i] -= 32;
+			}
+
+			char *cmd = (char*) buf;
+
+			// 權限檢查：未登入時只能使用 LOGIN
+			if (isLoggedIn == 0 && strncmp(cmd, "LOGIN ", 6) != 0) {
+				VCP_Send("Please login first.\r\n");
+				VCP_Send(prompt);
+				continue;
+			}
+
+			// 指令處理
+			switch (VCP_ParseCommand(cmd)) {
+			case CMD_LEDON:
+				HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
+				VCP_Send("LED ON\r\n");
+				break;
+
+			case CMD_LEDOFF:
+				HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
+				VCP_Send("LED OFF\r\n");
+				break;
+
+			case CMD_GETTIME: {
+				DS3231_Time t;
+				char out[32];
+				if (DS3231_GetTime(&hi2c1, &t) == HAL_OK) {
+					snprintf(out, sizeof(out), "%02d:%02d:%02d\r\n", t.hours, t.minutes, t.seconds);
+				} else {
+					strcpy(out, "RTC ERROR\r\n");
+				}
+				VCP_Send(out);
+				break;
+			}
+
+			case CMD_GETDT: {
+				DS3231_Time t;
+				char out[48];
+				if (DS3231_GetTime(&hi2c1, &t) == HAL_OK) {
+					snprintf(out, sizeof(out), "20%02d-%02d-%02d %02d:%02d:%02d\r\n", t.year, t.month, t.date, t.hours, t.minutes, t.seconds);
+				} else {
+					strcpy(out, "RTC ERROR\r\n");
+				}
+				VCP_Send(out);
+				break;
+			}
+
+			case CMD_GETAHT: {
+							float humi = 0, temp = 0;
+							char out[64];
+							if (AHT10_Read(&hi2c1, &temp, &humi) == HAL_OK) {
+								/* * 使用 (int) 將浮點數轉為 10 進位整數
+								 * 加上 0.5f 可以達到四捨五入的效果
+								 */
+								int temp_int = (int)(temp + 0.5f);
+								int humi_int = (int)(humi + 0.5f);
+
+								// 輸出格式使用 %d 顯示 10 進位整數
+								snprintf(out, sizeof(out), "Temp: %d C, Humi: %d %%\r\n", temp_int, humi_int);
+							} else {
+								strcpy(out, "AHT10 Read Error!\r\n");
+							}
+							VCP_Send(out);
+							break;
+						}
+
+			case CMD_SETTIME: {
+				DS3231_Time t;
+				const char *p = cmd + 8;
+				while (*p == ' ') p++;
+				uint8_t hh = (p[0] - '0') * 10 + (p[1] - '0');
+				uint8_t mm = (p[3] - '0') * 10 + (p[4] - '0');
+				uint8_t ss = (p[6] - '0') * 10 + (p[7] - '0');
+				if (DS3231_GetTime(&hi2c1, &t) == HAL_OK) {
+					t.hours = hh; t.minutes = mm; t.seconds = ss;
+					if (DS3231_SetTime(&hi2c1, &t) == HAL_OK) VCP_Send("TIME UPDATED\r\n");
+					else VCP_Send("RTC ERROR\r\n");
+				}
+				break;
+			}
+
+			case CMD_SETDATE: {
+				DS3231_Time t;
+				const char *p = cmd + 8;
+				while (*p == ' ') p++;
+				if (p[0] == '\0' || p[4] != '-' || p[7] != '-') {
+					VCP_Send("Usage: SETDATE YYYY-MM-DD\r\n");
+					break;
+				}
+				uint16_t yyyy = (uint16_t) ((p[0]-'0')*1000 + (p[1]-'0')*100 + (p[2]-'0')*10 + (p[3]-'0'));
+				uint8_t mo = (p[5]-'0')*10 + (p[6]-'0');
+				uint8_t dd = (p[8]-'0')*10 + (p[9]-'0');
+				if (DS3231_GetTime(&hi2c1, &t) == HAL_OK) {
+					t.year = (uint8_t)(yyyy - 2000); t.month = mo; t.date = dd;
+					t.day = weekday_iso(yyyy, mo, dd);
+					if (DS3231_SetTime(&hi2c1, &t) == HAL_OK) VCP_Send("DATE UPDATED\r\n");
+					else VCP_Send("RTC ERROR\r\n");
+				}
+				break;
+			}
+
+			case CMD_HELP:
+				VCP_Send("Commands:\r\nLEDON, LEDOFF, GETTIME, GETDT, GETAHT\r\n"
+						 "SETTIME HH:MM:SS, SETDATE YYYY-MM-DD\r\n"
+						 "PASS GET, PASS SET <pwd>, LOGOUT\r\n");
+				if (isAdmin) VCP_Send("Admin DBG: DBG_TICK, DBG_TCNT, DBG_TASK\r\n");
+				break;
+
+			case CMD_PASS_GET: {
+				char out[32];
+				snprintf(out, sizeof(out), "USER PASSWORD: %s\r\n", g_AppConfigRAM.password);
+				VCP_Send(out);
+				break;
+			}
+
+			case CMD_PASS_SET: {
+				const char *pwd = cmd + 9;
+				if (strlen(pwd) > 0 && strlen(pwd) <= 6) {
+					strcpy(g_AppConfigRAM.password, pwd);
+					EEPROM_Config_SaveNow();
+					VCP_Send("PASSWORD UPDATED\r\n");
+				} else {
+					VCP_Send("ERR: 1-6 chars\r\n");
+				}
+				break;
+			}
+
+			case CMD_LOGIN: {
+				const char *pwd = cmd + 6;
+				if (strcmp(pwd, g_AppConfigRAM.password) == 0) {
+					isLoggedIn = 1; isAdmin = 0;
+					VCP_Send("LOGIN USER OK\r\n");
+				} else if (strcmp(pwd, g_AppConfigRAM.admin_password) == 0) {
+					isLoggedIn = 1; isAdmin = 1;
+					VCP_Send("ADMIN MODE ENABLED\r\n");
+				} else {
+					VCP_Send("LOGIN FAIL\r\n");
+				}
+				break;
+			}
+
+			case CMD_LOGOUT:
+				isLoggedIn = 0; isAdmin = 0;
+				VCP_Send("LOGOUT SUCCESS\r\n");
+				break;
+
+			case CMD_DBG_TICK:
+				if (isAdmin) {
+					char b[32];
+					snprintf(b, sizeof(b), "Tick: %lu\r\n", (uint32_t)xTaskGetTickCount());
+					VCP_Send(b);
+				} else VCP_Send("UNKNOWN CMD\r\n");
+				break;
+
+			default:
+				VCP_Send("UNKNOWN CMD\r\n");
+				break;
+			}
+			VCP_Send(prompt);
+		}
+		vTaskDelay(pdMS_TO_TICKS(10));
+	}
+}
+
+static uint8_t weekday_iso(uint16_t y, uint8_t m, uint8_t d) {
+	if (m < 3) { m += 12; y--; }
+	uint16_t k = y % 100, j = y / 100;
+	uint8_t h = (d + (13 * (m + 1)) / 5 + k + k / 4 + j / 4 + 5 * j) % 7;
+	return ((h + 5) % 7) + 1; // 1=Mon ... 7=Sun
+}
+
